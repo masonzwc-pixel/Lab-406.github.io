@@ -1,0 +1,1090 @@
+<!DOCTYPE html>
+<html lang="th">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ระบบบันทึกผลโครงการประเมินคุณภาพทางห้องปฏิบัติการ</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+      @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap');
+      body {
+        font-family: 'Inter', sans-serif;
+      }
+    </style>
+</head>
+<body class="bg-gray-100 font-sans antialiased">
+
+    <div id="root"></div>
+
+    <script type="module">
+        import { createClient } from 'https://cdn.jsdelivr.net/npm/@supabase/supabase-js/+esm';
+
+        // --- Core Application State & Logic ---
+        let appState = {
+            db: null,
+            isAuthReady: false,
+            user: null, // Stores { role, name, permissions }
+            activeTab: 'eqa',
+            loginError: '',
+            eqas: [],
+            interlabs: [],
+            history: [],
+            masterData: { projects: [], organizations: [], tests: [], results: ['pass', 'fail', 'acceptable', 'unacceptable', 'satisfactory', 'unsatisfactory'] },
+            users: [],
+            appSettings: { systemName: 'ระบบบันทึกผลโครงการประเมินคุณภาพทางห้องปฏิบัติการ', logoUrl: '' },
+            isLoading: true,
+            editingItem: null,
+            adminSubTab: 'masterData',
+        };
+
+        const root = document.getElementById('root');
+
+        // --- Supabase Configuration & Initialization ---
+        // REPLACE WITH YOUR SUPABASE URL AND ANON KEY
+        const SUPABASE_URL = 'YOUR_SUPABASE_URL';
+        const SUPABASE_ANON_KEY = 'YOUR_SUPABASE_ANON_KEY';
+        
+        const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+
+        const initializeSupabase = async () => {
+            try {
+                appState.db = supabase;
+                console.log("Supabase initialized.");
+                appState.isAuthReady = true;
+                await seedInitialData();
+                await fetchAllData();
+            } catch (error) {
+                console.error("Supabase initialization error:", error);
+                appState.isAuthReady = false;
+                appState.isLoading = false;
+                render();
+            }
+        };
+
+        // --- Data Seeding (Create default users if none exist) ---
+        const seedInitialData = async () => {
+            if (!appState.db) return;
+
+            // Seed Users
+            const { data: users, error: usersError } = await supabase.from('users').select('username');
+            if (usersError) console.error("Error fetching users:", usersError);
+            if (users.length === 0) {
+                console.log("No users found. Seeding default admin and user accounts.");
+                const { error } = await supabase.from('users').insert([
+                    {
+                        username: 'admin',
+                        password: 'admin123',
+                        role: 'admin',
+                        permissions: { canAccessEQA: true, canAccessInterlab: true, canAccessHistory: true, canAccessAdmin: true }
+                    },
+                    {
+                        username: 'user',
+                        password: 'user123',
+                        role: 'user',
+                        permissions: { canAccessEQA: true, canAccessInterlab: true, canAccessHistory: false, canAccessAdmin: false }
+                    }
+                ]);
+                if (error) console.error("Error seeding default users:", error);
+                else console.log("Default users seeded successfully.");
+            }
+
+            // Seed Master Data
+            const { data: masterData, error: masterDataError } = await supabase.from('master_data').select('*').single();
+            if (masterDataError && masterDataError.code !== 'PGRST116') { // PGRST116 means no rows found
+                 console.error("Error fetching master data:", masterDataError);
+            }
+            if (!masterData) {
+                console.log("No master data found. Seeding default master data.");
+                await supabase.from('master_data').insert({
+                    projects: ['โครงการ ก', 'โครงการ ข'],
+                    organizations: ['หน่วยงาน A', 'หน่วยงาน B'],
+                    tests: ['การทดสอบที่ 1', 'การทดสอบที่ 2'],
+                });
+            }
+
+            // Seed App Settings
+            const { data: settings, error: settingsError } = await supabase.from('settings').select('*').single();
+            if (settingsError && settingsError.code !== 'PGRST116') {
+                console.error("Error fetching settings:", settingsError);
+            }
+            if (!settings) {
+                console.log("No settings found. Seeding default settings.");
+                await supabase.from('settings').insert(appState.appSettings);
+            }
+        };
+
+        // --- Data Fetching ---
+        const fetchAllData = async () => {
+            if (!appState.db) return;
+            appState.isLoading = true;
+            render();
+
+            const [eqas, interlabs, history, masterData, users, appSettings] = await Promise.all([
+                supabase.from('eqas').select('*'),
+                supabase.from('interlabs').select('*'),
+                supabase.from('history').select('*').order('timestamp', { ascending: false }),
+                supabase.from('master_data').select('*').single(),
+                supabase.from('users').select('*'),
+                supabase.from('settings').select('*').single(),
+            ]);
+
+            appState.eqas = eqas.data || [];
+            appState.interlabs = interlabs.data || [];
+            appState.history = history.data || [];
+            appState.masterData.projects = masterData.data?.projects || [];
+            appState.masterData.organizations = masterData.data?.organizations || [];
+            appState.masterData.tests = masterData.data?.tests || [];
+            appState.users = users.data || [];
+            appState.appSettings = appSettings.data || appState.appSettings;
+            appState.isLoading = false;
+            render();
+        };
+
+        // --- Utility Functions ---
+        const logAction = async (username, action, details) => {
+            if (!appState.db) return false;
+            try {
+                const { error } = await supabase.from('history').insert({
+                    timestamp: new Date().toISOString(),
+                    username,
+                    action,
+                    details,
+                });
+                if (error) throw error;
+                await fetchAllData();
+                return true;
+            } catch (e) {
+                console.error("Error logging action: ", e);
+                return false;
+            }
+        };
+        
+        const isPass = (result) => ['acceptable', 'satisfactory', 'pass'].includes(result.toLowerCase());
+
+        // --- Event Handlers & API Calls ---
+        const handleLogin = async (username, password) => {
+            if (appState.isLoading) {
+                appState.loginError = 'กำลังเตรียมระบบ กรุณารอสักครู่...';
+                render();
+                return;
+            }
+            appState.loginError = '';
+            const foundUser = appState.users.find(u => u.username === username && u.password === password);
+            if (foundUser) {
+                appState.user = { 
+                    role: foundUser.role, 
+                    name: foundUser.username,
+                    permissions: foundUser.permissions || {
+                        canAccessEQA: true,
+                        canAccessInterlab: true,
+                        canAccessHistory: false,
+                        canAccessAdmin: false,
+                    }
+                };
+                await logAction(foundUser.username, 'Login', `เข้าสู่ระบบในฐานะ ${foundUser.role === 'admin' ? 'ผู้ดูแลระบบ' : 'ผู้ใช้งานทั่วไป'}`);
+            } else {
+                appState.loginError = 'ชื่อผู้ใช้หรือรหัสผ่านไม่ถูกต้อง';
+            }
+            render();
+        };
+
+        const handleLogout = async () => {
+            if (appState.user) {
+                await logAction(appState.user.name, 'Logout', 'ออกจากระบบ');
+                appState.user = null;
+                appState.activeTab = 'eqa';
+                render();
+            }
+        };
+
+        const handleSaveData = async (type, data) => {
+            if (!appState.db || !appState.user) return false;
+            try {
+                const { error } = await supabase.from(type).insert({
+                    ...data,
+                    timestamp: new Date().toISOString(),
+                });
+                if (error) throw error;
+                await logAction(appState.user.name, 'Save Data', `บันทึกข้อมูล ${type.toUpperCase()} ใหม่`);
+                await fetchAllData();
+                return true;
+            } catch (e) {
+                console.error("Error saving document: ", e);
+                return false;
+            }
+        };
+        
+        const handleDeleteData = async (type, id) => {
+            if (!appState.db || appState.user.role !== 'admin') {
+                console.error("Permission denied or not logged in.");
+                return false;
+            }
+            if (!confirm("คุณแน่ใจหรือไม่ว่าต้องการลบข้อมูลนี้?")) return false;
+            try {
+                const { error } = await supabase.from(type).delete().eq('id', id);
+                if (error) throw error;
+                await logAction(appState.user.name, 'Delete Data', `ลบข้อมูล ${type.toUpperCase()} (ID: ${id})`);
+                await fetchAllData();
+                return true;
+            } catch (e) {
+                console.error("Error deleting document: ", e);
+                return false;
+            }
+        };
+        
+        const handleUpdateData = async (type, id, data) => {
+            if (!appState.db || appState.user.role !== 'admin') {
+                console.error("Permission denied or not logged in.");
+                return false;
+            }
+            try {
+                const { error } = await supabase.from(type).update(data).eq('id', id);
+                if (error) throw error;
+                await logAction(appState.user.name, 'Update Data', `แก้ไขข้อมูล ${type.toUpperCase()} (ID: ${id})`);
+                await fetchAllData();
+                return true;
+            } catch (e) {
+                console.error("Error updating document: ", e);
+                return false;
+            }
+        };
+
+        const handleAddMasterData = async (type, value) => {
+            if (!appState.db || appState.user?.role !== 'admin') return;
+            const updatedList = [...appState.masterData[type], value];
+            try {
+                const { error } = await supabase.from('master_data').update({ [type]: updatedList }).eq('id', appState.masterData.id);
+                if (error) throw error;
+                await logAction(appState.user.name, 'Update Master Data', `เพิ่มข้อมูลหลัก ${type}: ${value}`);
+                await fetchAllData();
+            } catch (e) {
+                console.error("Error updating master data: ", e);
+            }
+        };
+
+        const handleDeleteMasterData = async (type, value) => {
+            if (!appState.db || appState.user?.role !== 'admin') return;
+            const updatedList = appState.masterData[type].filter(item => item !== value);
+            try {
+                const { error } = await supabase.from('master_data').update({ [type]: updatedList }).eq('id', appState.masterData.id);
+                if (error) throw error;
+                await logAction(appState.user.name, 'Update Master Data', `ลบข้อมูลหลัก ${type}: ${value}`);
+                await fetchAllData();
+            } catch (e) {
+                console.error("Error updating master data: ", e);
+            }
+        };
+
+        const handleUpdateSettings = async (newSettings) => {
+            if (!appState.db || appState.user?.role !== 'admin') return;
+            const docId = appState.appSettings.id;
+            try {
+                const { error } = await supabase.from('settings').update(newSettings).eq('id', docId);
+                if (error) throw error;
+                await logAction(appState.user.name, 'Update Settings', 'แก้ไขการตั้งค่าระบบ');
+                await fetchAllData();
+            } catch (e) {
+                console.error("Error updating settings: ", e);
+            }
+        };
+
+        const handleAddUser = async (formData) => {
+            if (!appState.db || appState.user?.role !== 'admin') return;
+            try {
+                const { error } = await supabase.from('users').insert(formData);
+                if (error) throw error;
+                await logAction(appState.user.name, 'Add User', `เพิ่มผู้ใช้ใหม่: ${formData.username}`);
+                await fetchAllData();
+            } catch (e) {
+                console.error("Error adding user: ", e);
+            }
+        };
+        
+        const handleDeleteUser = async (id, username) => {
+            if (!appState.db || appState.user?.role !== 'admin') return;
+            if (!confirm(`คุณแน่ใจหรือไม่ว่าต้องการลบผู้ใช้ ${username} นี้?`)) return;
+            try {
+                const { error } = await supabase.from('users').delete().eq('id', id);
+                if (error) throw error;
+                await logAction(appState.user.name, 'Delete User', `ลบผู้ใช้: ${username}`);
+                await fetchAllData();
+            } catch (e) {
+                console.error("Error deleting user: ", e);
+            }
+        };
+
+        const handleUpdateUser = async (id, formData) => {
+            if (!appState.db || appState.user?.role !== 'admin') return;
+            try {
+                const { error } = await supabase.from('users').update(formData).eq('id', id);
+                if (error) throw error;
+                await logAction(appState.user.name, 'Update User', `แก้ไขข้อมูลผู้ใช้: ${formData.username}`);
+                await fetchAllData();
+            } catch (e) {
+                console.error("Error updating user: ", e);
+            }
+        };
+        
+        const handleClearData = async (collectionToClear, startDate, endDate) => {
+            if (!appState.db || appState.user?.role !== 'admin') return;
+            
+            let query = supabase.from(collectionToClear).delete();
+
+            if (startDate) {
+                query = query.gte(collectionToClear === 'history' ? 'timestamp' : 'dateReceived', startDate);
+            }
+            if (endDate) {
+                query = query.lte(collectionToClear === 'history' ? 'timestamp' : 'dateReceived', endDate);
+            }
+            
+            try {
+                const { count, error } = await query.rpc('delete_rows_in_range', { table_name: collectionToClear, start_date: startDate, end_date: endDate }); // Placeholder for a more complex Supabase function, manual deletion is safer.
+
+                if (error) throw error;
+                
+                alert(`ลบข้อมูลสำเร็จ!`);
+                await logAction(appState.user.name, 'Clear Data', `ลบข้อมูล ${collectionToClear.toUpperCase()} ทั้งหมดที่ตรงตามเงื่อนไข`);
+                await fetchAllData();
+            } catch (error) {
+                console.error("Error deleting documents: ", error);
+                alert('เกิดข้อผิดพลาดในการลบข้อมูล');
+            }
+        };
+
+        // --- DOM Rendering Functions ---
+        const renderHeader = () => {
+            if (!appState.user) return '';
+            const logo = appState.appSettings.logoUrl ? 
+                `<img src="${appState.appSettings.logoUrl}" alt="System Logo" class="h-12 w-auto mr-4" onerror="this.onerror=null;this.src='https://placehold.co/48x48/CCCCCC/333333?text=Logo'"/>` : '';
+
+            return `
+                <header class="mb-8">
+                    <div class="bg-white rounded-xl shadow-2xl p-6">
+                        <div class="flex justify-between items-center mb-4">
+                            <div class="flex items-center">
+                                ${logo}
+                                <h1 class="text-3xl font-bold" style="color: #2c3e50;">${appState.appSettings.systemName}</h1>
+                            </div>
+                            <div class="flex items-center space-x-2">
+                                <span class="text-gray-700">ผู้ใช้งาน: ${appState.user.name}</span>
+                                <button id="logout-btn" class="px-4 py-2 text-sm rounded-lg text-white font-bold transition duration-300 bg-red-500 hover:bg-red-600">ออกจากระบบ</button>
+                            </div>
+                        </div>
+                        <nav class="flex space-x-2 sm:space-x-4 border-t pt-4 overflow-x-auto">
+                            ${appState.user.permissions?.canAccessEQA ? `<button id="tab-eqa" class="px-4 py-2 rounded-full font-semibold transition duration-300 ${appState.activeTab === 'eqa' ? 'bg-blue-600 text-white shadow-md' : 'text-gray-600 hover:bg-gray-200'}">EQA</button>` : ''}
+                            ${appState.user.permissions?.canAccessInterlab ? `<button id="tab-interlab" class="px-4 py-2 rounded-full font-semibold transition duration-300 ${appState.activeTab === 'interlab' ? 'bg-blue-600 text-white shadow-md' : 'text-gray-600 hover:bg-gray-200'}">Interlab Comparison</button>` : ''}
+                            <button id="tab-summary" class="px-4 py-2 rounded-full font-semibold transition duration-300 ${appState.activeTab === 'summary' ? 'bg-blue-600 text-white shadow-md' : 'text-gray-600 hover:bg-gray-200'}">สรุปผลประจำปี</button>
+                            ${appState.user.role === 'admin' ? `<button id="tab-admin" class="px-4 py-2 rounded-full font-semibold transition duration-300 ${appState.activeTab === 'admin' ? 'bg-blue-600 text-white shadow-md' : 'text-gray-600 hover:bg-gray-200'}">แผงควบคุมผู้ดูแลระบบ</button>` : ''}
+                        </nav>
+                    </div>
+                </header>
+            `;
+        };
+
+        const renderLoginComponent = () => {
+            if (appState.isLoading) {
+                 return `
+                    <div class="flex flex-col items-center justify-center p-8 bg-gray-100 min-h-screen">
+                        <div class="bg-white p-8 rounded-xl shadow-2xl w-full max-w-sm text-center">
+                            <h2 class="text-2xl font-bold text-gray-800 mb-6">กำลังเตรียมระบบ...</h2>
+                            <p class="text-gray-600">โปรดรอสักครู่ในขณะที่แอปพลิเคชันกำลังโหลดข้อมูล</p>
+                        </div>
+                    </div>
+                `;
+            }
+            return `
+                <div class="flex flex-col items-center justify-center p-8 bg-gray-100 min-h-screen">
+                    <div class="bg-white p-8 rounded-xl shadow-2xl w-full max-w-sm">
+                        <h2 class="text-2xl font-bold text-center text-gray-800 mb-6">เข้าสู่ระบบ</h2>
+                        <form id="login-form">
+                            <div class="mb-4">
+                                <label class="block text-gray-700 mb-2">ชื่อผู้ใช้</label>
+                                <input type="text" id="username" class="w-full p-3 rounded-lg border focus:outline-none focus:ring-2 focus:ring-blue-500" placeholder="admin หรือ user" required />
+                            </div>
+                            <div class="mb-6">
+                                <label class="block text-gray-700 mb-2">รหัสผ่าน</label>
+                                <input type="password" id="password" class="w-full p-3 rounded-lg border focus:outline-none focus:ring-2 focus:ring-500" placeholder="admin123 หรือ user123" required />
+                            </div>
+                            <button type="submit" class="w-full text-white font-bold py-3 rounded-lg shadow-lg transition duration-300 bg-gradient-to-r from-blue-400 to-purple-500 hover:from-blue-500 hover:to-purple-600">
+                                เข้าสู่ระบบ
+                            </button>
+                            ${appState.loginError ? `<p class="text-red-500 text-center mt-4">${appState.loginError}</p>` : ''}
+                        </form>
+                    </div>
+                </div>
+            `;
+        };
+
+        const renderDataEntryForm = (type) => {
+            const title = type === 'eqas' ? 'บันทึกข้อมูล EQA' : 'บันทึกข้อมูล Interlab Comparison';
+            const gradientClass = 'bg-gradient-to-r from-blue-400 to-purple-500 hover:from-blue-500 hover:to-purple-600';
+            const statusId = `status-${type}`;
+
+            return `
+                <div class="bg-white p-6 rounded-lg shadow-md mb-6">
+                    <h3 class="text-xl font-semibold text-gray-800 mb-4">${title}</h3>
+                    <form id="data-entry-form-${type}" class="grid grid-cols-1 md:grid-cols-2 gap-4">
+                        <div>
+                            <label class="block text-gray-700 mb-1">วันที่ได้รับตัวอย่าง</label>
+                            <input type="date" name="dateReceived" class="w-full p-2 border rounded-lg" required />
+                        </div>
+                        <div>
+                            <label class="block text-gray-700 mb-1">วันที่ส่งผลกลับ</label>
+                            <input type="date" name="dateSent" class="w-full p-2 border rounded-lg" required />
+                        </div>
+                        <div>
+                            <label class="block text-gray-700 mb-1">โครงการ</label>
+                            <select name="project" class="w-full p-2 border rounded-lg" required>
+                                <option value="">เลือกโครงการ</option>
+                                ${appState.masterData.projects.map(p => `<option value="${p}">${p}</option>`).join('')}
+                            </select>
+                        </div>
+                        <div>
+                            <label class="block text-gray-700 mb-1">รอบที่</label>
+                            <input type="text" name="round" class="w-full p-2 border rounded-lg" required />
+                        </div>
+                        <div>
+                            <label class="block text-gray-700 mb-1">หน่วยงานประเมิน</label>
+                            <select name="organization" class="w-full p-2 border rounded-lg" required>
+                                <option value="">เลือกหน่วยงาน</option>
+                                ${appState.masterData.organizations.map(o => `<option value="${o}">${o}</option>`).join('')}
+                            </select>
+                        </div>
+                        <div>
+                            <label class="block text-gray-700 mb-1">ชื่อการทดสอบ</label>
+                            <select name="testName" class="w-full p-2 border rounded-lg" required>
+                                <option value="">เลือกการทดสอบ</option>
+                                ${appState.masterData.tests.map(t => `<option value="${t}">${t}</option>`).join('')}
+                            </select>
+                        </div>
+                        <div class="col-span-1 md:col-span-2">
+                            <label class="block text-gray-700 mb-1">ผลการประเมิน</label>
+                            <select name="result" class="w-full p-2 border rounded-lg" required>
+                                <option value="">เลือกผลการประเมิน</option>
+                                ${appState.masterData.results.map(r => `<option value="${r}">${r}</option>`).join('')}
+                            </select>
+                        </div>
+                        <div class="col-span-1 md:col-span-2 mt-4">
+                            <button type="submit" class="w-full text-white font-bold py-3 rounded-lg shadow-lg transition duration-300 ${gradientClass}">
+                                บันทึกข้อมูล
+                            </button>
+                            <p id="${statusId}" class="text-center mt-2 text-gray-600"></p>
+                        </div>
+                    </form>
+                </div>
+            `;
+        };
+        
+        const renderDataDisplay = (data, type) => {
+            const title = type === 'eqas' ? 'ข้อมูล EQA' : 'ข้อมูล Interlab';
+            const isAdmin = appState.user.role === 'admin';
+            
+            const tableRows = data.map(item => `
+                <tr data-id="${item.id}">
+                    <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-900">${item.dateReceived}</td>
+                    <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-900">${item.project}</td>
+                    <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-900">${item.testName}</td>
+                    <td class="px-6 py-4 whitespace-nowrap text-sm">
+                        <span class="px-2 inline-flex text-xs leading-5 font-semibold rounded-full ${isPass(item.result) ? 'bg-green-100 text-green-800' : 'bg-red-100 text-red-800'}">
+                            ${item.result}
+                        </span>
+                    </td>
+                    ${isAdmin ? `
+                    <td class="px-6 py-4 whitespace-nowrap text-right text-sm font-medium space-x-2">
+                        <button class="edit-btn p-2 rounded-lg text-white font-bold transition duration-300 bg-gradient-to-r from-blue-300 to-cyan-400 hover:from-blue-400 hover:to-cyan-500">
+                            แก้ไข
+                        </button>
+                        <button class="delete-btn p-2 rounded-lg text-white font-bold transition duration-300 bg-gradient-to-r from-red-400 to-amber-300 hover:from-red-500 hover:to-amber-400">
+                            ลบ
+                        </button>
+                    </td>` : ''}
+                </tr>
+            `).join('');
+
+            return `
+                <div class="bg-white p-6 rounded-lg shadow-md mb-6 overflow-x-auto">
+                    <h3 class="text-xl font-semibold text-gray-800 mb-4">${title}</h3>
+                    <table class="min-w-full divide-y divide-gray-200">
+                        <thead class="bg-gray-50">
+                            <tr>
+                                <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">วันที่ได้รับ</th>
+                                <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">โครงการ</th>
+                                <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">ชื่อการทดสอบ</th>
+                                <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">ผลการประเมิน</th>
+                                ${isAdmin ? '<th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">แก้ไข/ลบ</th>' : ''}
+                            </tr>
+                        </thead>
+                        <tbody class="bg-white divide-y divide-gray-200">
+                            ${tableRows || `<tr><td colspan="5" class="text-center text-gray-500 mt-4 py-4">ยังไม่มีข้อมูล</td></tr>`}
+                        </tbody>
+                    </table>
+                </div>
+            `;
+        };
+        
+        const renderModal = () => {
+            if (!appState.editingItem) return '';
+            const item = appState.editingItem;
+            return `
+                <div class="fixed inset-0 bg-gray-600 bg-opacity-50 overflow-y-auto h-full w-full flex items-center justify-center z-50">
+                    <div class="bg-white p-8 rounded-lg shadow-xl w-full max-w-lg">
+                        <h4 class="text-2xl font-bold mb-4">แก้ไขข้อมูล</h4>
+                        <form id="edit-form" data-id="${item.id}" data-type="${appState.activeTab}">
+                            <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+                                <input type="date" name="dateReceived" value="${item.dateReceived}" class="w-full p-2 border rounded-lg" required />
+                                <input type="date" name="dateSent" value="${item.dateSent}" class="w-full p-2 border rounded-lg" required />
+                                <select name="project" class="w-full p-2 border rounded-lg" required>
+                                    ${appState.masterData.projects.map(p => `<option value="${p}" ${p === item.project ? 'selected' : ''}>${p}</option>`).join('')}
+                                </select>
+                                <input type="text" name="round" value="${item.round}" class="w-full p-2 border rounded-lg" required />
+                                <select name="organization" class="w-full p-2 border rounded-lg" required>
+                                    ${appState.masterData.organizations.map(o => `<option value="${o}" ${o === item.organization ? 'selected' : ''}>${o}</option>`).join('')}
+                                </select>
+                                <select name="testName" class="w-full p-2 border rounded-lg" required>
+                                    ${appState.masterData.tests.map(t => `<option value="${t}" ${t === item.testName ? 'selected' : ''}>${t}</option>`).join('')}
+                                </select>
+                                <div class="col-span-1 md:col-span-2">
+                                    <select name="result" class="w-full p-2 border rounded-lg" required>
+                                        ${appState.masterData.results.map(r => `<option value="${r}" ${r === item.result ? 'selected' : ''}>${r}</option>`).join('')}
+                                    </select>
+                                </div>
+                            </div>
+                            <div class="flex justify-end space-x-2 mt-4">
+                                <button type="button" id="cancel-edit" class="px-4 py-2 bg-gray-300 rounded-lg">ยกเลิก</button>
+                                <button type="submit" class="px-4 py-2 bg-blue-600 text-white rounded-lg">บันทึก</button>
+                            </div>
+                        </form>
+                    </div>
+                </div>
+            `;
+        };
+
+        const renderAnnualSummary = () => {
+            const allYears = Array.from(new Set([
+                ...appState.eqas.map(item => new Date(item.dateReceived).getFullYear()),
+                ...appState.interlabs.map(item => new Date(item.dateReceived).getFullYear())
+            ])).sort((a, b) => b - a);
+            
+            const filteredEqas = appState.eqas.filter(item => {
+                const year = new Date(item.dateReceived).getFullYear().toString();
+                return appState.selectedYear === 'all' || year === appState.selectedYear;
+            });
+            
+            const filteredInterlabs = appState.interlabs.filter(item => {
+                const year = new Date(item.dateReceived).getFullYear().toString();
+                return appState.selectedYear === 'all' || year === appState.selectedYear;
+            });
+            
+            const summary = {
+                eqaCount: filteredEqas.length,
+                interlabCount: filteredInterlabs.length,
+                eqaPass: filteredEqas.filter(item => isPass(item.result)).length,
+                interlabPass: filteredInterlabs.filter(item => isPass(item.result)).length,
+            };
+            
+            return `
+                <div class="bg-white p-6 rounded-lg shadow-md mb-6">
+                    <h3 class="text-xl font-semibold text-gray-800 mb-4">สรุปผลประจำปี</h3>
+                    <div class="flex flex-col sm:flex-row gap-4 mb-6">
+                        <div class="w-full sm:w-1/2">
+                            <label class="block text-gray-700 mb-1">กรองตามปี</label>
+                            <select id="summary-year-filter" class="w-full p-2 border rounded-lg">
+                                <option value="all">ทั้งหมด</option>
+                                ${allYears.map(year => `<option value="${year}">${year}</option>`).join('')}
+                            </select>
+                        </div>
+                    </div>
+                    <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                        <div class="bg-blue-50 p-4 rounded-lg">
+                            <p class="text-lg font-bold text-blue-800">จำนวนการประเมิน EQA</p>
+                            <p class="text-3xl font-bold text-blue-600">${summary.eqaCount}</p>
+                        </div>
+                        <div class="bg-purple-50 p-4 rounded-lg">
+                            <p class="text-lg font-bold text-purple-800">ผล EQA ที่ผ่านเกณฑ์</p>
+                            <p class="text-3xl font-bold text-purple-600">${summary.eqaPass} (${summary.eqaCount > 0 ? ((summary.eqaPass / summary.eqaCount) * 100).toFixed(1) : 0}%)</p>
+                        </div>
+                        <div class="bg-rose-50 p-4 rounded-lg">
+                            <p class="text-lg font-bold text-rose-800">จำนวนการประเมิน Interlab</p>
+                            <p class="text-3xl font-bold text-rose-600">${summary.interlabCount}</p>
+                        </div>
+                        <div class="bg-pink-50 p-4 rounded-lg">
+                            <p class="text-lg font-bold text-pink-600">ผล Interlab ที่ผ่านเกณฑ์</p>
+                            <p class="text-3xl font-bold text-pink-600">${summary.interlabPass} (${summary.interlabCount > 0 ? ((summary.interlabPass / summary.interlabCount) * 100).toFixed(1) : 0}%)</p>
+                        </div>
+                    </div>
+                </div>
+            `;
+        };
+        
+        const renderAdminDashboard = () => {
+            let contentHtml = '';
+            switch(appState.adminSubTab) {
+                case 'masterData':
+                    contentHtml = renderMasterDataManager();
+                    break;
+                case 'userManagement':
+                    contentHtml = renderUserManager();
+                    break;
+                case 'history':
+                    contentHtml = renderUsageHistory();
+                    break;
+                case 'clearData':
+                    contentHtml = renderDataClearer();
+                    break;
+                case 'settings':
+                    contentHtml = renderAdminSettings();
+                    break;
+            }
+
+            return `
+                <div class="bg-white p-6 rounded-lg shadow-md mb-6">
+                    <h3 class="text-xl font-semibold text-gray-800 mb-4">แผงควบคุมผู้ดูแลระบบ</h3>
+                    <div class="flex space-x-2 sm:space-x-4 mb-6 border-b pb-4 overflow-x-auto">
+                        <button id="sub-tab-masterData" class="px-4 py-2 rounded-full font-semibold transition duration-300 ${appState.adminSubTab === 'masterData' ? 'bg-blue-600 text-white shadow-md' : 'text-gray-600 hover:bg-gray-200'}">จัดการข้อมูลหลัก</button>
+                        <button id="sub-tab-userManagement" class="px-4 py-2 rounded-full font-semibold transition duration-300 ${appState.adminSubTab === 'userManagement' ? 'bg-blue-600 text-white shadow-md' : 'text-gray-600 hover:bg-gray-200'}">จัดการผู้ใช้งาน</button>
+                        <button id="sub-tab-history" class="px-4 py-2 rounded-full font-semibold transition duration-300 ${appState.adminSubTab === 'history' ? 'bg-blue-600 text-white shadow-md' : 'text-gray-600 hover:bg-gray-200'}">ประวัติการใช้งาน</button>
+                        <button id="sub-tab-clearData" class="px-4 py-2 rounded-full font-semibold transition duration-300 ${appState.adminSubTab === 'clearData' ? 'bg-blue-600 text-white shadow-md' : 'text-gray-600 hover:bg-gray-200'}">ล้างข้อมูล</button>
+                        <button id="sub-tab-settings" class="px-4 py-2 rounded-full font-semibold transition duration-300 ${appState.adminSubTab === 'settings' ? 'bg-blue-600 text-white shadow-md' : 'text-gray-600 hover:bg-gray-200'}">ตั้งค่าระบบ</button>
+                    </div>
+                    <div>${contentHtml}</div>
+                </div>
+            `;
+        };
+
+        const renderMasterDataManager = () => {
+            return `
+                <div>
+                    <div class="mb-6 border-b pb-4">
+                        <h4 class="text-lg font-semibold text-gray-700 mb-2">โครงการ</h4>
+                        <form id="add-project-form">
+                            <input type="text" name="project" placeholder="เพิ่มโครงการใหม่" class="w-full p-2 border rounded-lg mb-2" required />
+                            <button type="submit" class="w-full py-2 rounded-lg text-white font-bold bg-gradient-to-r from-blue-400 to-purple-500 hover:from-blue-500 hover:to-purple-600">เพิ่มโครงการ</button>
+                        </form>
+                        <ul class="mt-4 space-y-2">
+                            ${appState.masterData.projects.map(p => `
+                                <li class="flex justify-between items-center p-2 bg-gray-100 rounded-lg">
+                                    <span>${p}</span>
+                                    <button class="delete-master-data-btn p-1 text-white rounded-lg bg-gradient-to-r from-red-400 to-amber-300 hover:from-red-500 hover:to-amber-400" data-type="projects" data-value="${p}">ลบ</button>
+                                </li>
+                            `).join('')}
+                        </ul>
+                    </div>
+                    <div class="mb-6 border-b pb-4">
+                        <h4 class="text-lg font-semibold text-gray-700 mb-2">การทดสอบ</h4>
+                        <form id="add-test-form">
+                            <input type="text" name="test" placeholder="เพิ่มการทดสอบใหม่" class="w-full p-2 border rounded-lg mb-2" required />
+                            <button type="submit" class="w-full py-2 rounded-lg text-white font-bold bg-gradient-to-r from-blue-400 to-purple-500 hover:from-blue-500 hover:to-purple-600">เพิ่มการทดสอบ</button>
+                        </form>
+                        <ul class="mt-4 space-y-2">
+                            ${appState.masterData.tests.map(t => `
+                                <li class="flex justify-between items-center p-2 bg-gray-100 rounded-lg">
+                                    <span>${t}</span>
+                                    <button class="delete-master-data-btn p-1 text-white rounded-lg bg-gradient-to-r from-red-400 to-amber-300 hover:from-red-500 hover:to-amber-400" data-type="tests" data-value="${t}">ลบ</button>
+                                </li>
+                            `).join('')}
+                        </ul>
+                    </div>
+                    <div class="mb-6">
+                        <h4 class="text-lg font-semibold text-gray-700 mb-2">หน่วยงานประเมิน</h4>
+                        <form id="add-org-form">
+                            <input type="text" name="org" placeholder="เพิ่มหน่วยงานใหม่" class="w-full p-2 border rounded-lg mb-2" required />
+                            <button type="submit" class="w-full py-2 rounded-lg text-white font-bold bg-gradient-to-r from-blue-400 to-purple-500 hover:from-blue-500 hover:to-purple-600">เพิ่มหน่วยงาน</button>
+                        </form>
+                        <ul class="mt-4 space-y-2">
+                            ${appState.masterData.organizations.map(o => `
+                                <li class="flex justify-between items-center p-2 bg-gray-100 rounded-lg">
+                                    <span>${o}</span>
+                                    <button class="delete-master-data-btn p-1 text-white rounded-lg bg-gradient-to-r from-red-400 to-amber-300 hover:from-red-500 hover:to-amber-400" data-type="organizations" data-value="${o}">ลบ</button>
+                                </li>
+                            `).join('')}
+                        </ul>
+                    </div>
+                </div>
+            `;
+        };
+
+        const renderUserManager = () => {
+            const tableRows = appState.users.map(u => `
+                <tr>
+                    <td class="px-6 py-4 whitespace-nowrap">${u.username}</td>
+                    <td class="px-6 py-4 whitespace-nowrap">${u.role === 'admin' ? 'ผู้ดูแลระบบ' : 'ผู้ใช้งานทั่วไป'}</td>
+                    <td class="px-6 py-4 whitespace-nowrap">
+                        ${u.permissions?.canAccessEQA ? `<span class="text-xs bg-blue-100 text-blue-800 px-2 py-1 rounded-full mr-1">EQA</span>` : ''}
+                        ${u.permissions?.canAccessInterlab ? `<span class="text-xs bg-purple-100 text-purple-800 px-2 py-1 rounded-full mr-1">Interlab</span>` : ''}
+                    </td>
+                    <td class="px-6 py-4 whitespace-nowrap text-sm font-medium space-x-2">
+                        <button class="edit-user-btn p-1 rounded-lg text-white bg-gradient-to-r from-blue-300 to-cyan-400 hover:from-blue-400 hover:to-cyan-500" data-id="${u.id}">แก้ไข</button>
+                        <button class="delete-user-btn p-1 rounded-lg text-white bg-gradient-to-r from-red-400 to-amber-300 hover:from-red-500 hover:to-amber-400" data-id="${u.id}" data-username="${u.username}">ลบ</button>
+                    </td>
+                </tr>
+            `).join('');
+
+            return `
+                <div class="bg-white p-6 rounded-lg shadow-md mb-6">
+                    <h3 class="text-xl font-semibold text-gray-800 mb-4">จัดการผู้ใช้งาน</h3>
+                    <form id="add-user-form" class="grid grid-cols-1 md:grid-cols-3 gap-4 mb-6">
+                        <input type="text" name="username" placeholder="ชื่อผู้ใช้" class="p-2 border rounded-lg" required />
+                        <input type="password" name="password" placeholder="รหัสผ่าน" class="p-2 border rounded-lg" required />
+                        <select name="role" class="p-2 border rounded-lg">
+                            <option value="user">ผู้ใช้งานทั่วไป</option>
+                            <option value="admin">ผู้ดูแลระบบ</option>
+                        </select>
+                        <div class="md:col-span-3 flex items-center justify-between mt-2">
+                            <p class="text-sm font-semibold text-gray-700">สิทธิ์การเข้าถึง:</p>
+                            <label class="flex items-center space-x-2">
+                                <input type="checkbox" name="canAccessEQA" checked />
+                                <span class="text-sm">EQA</span>
+                            </label>
+                            <label class="flex items-center space-x-2">
+                                <input type="checkbox" name="canAccessInterlab" checked />
+                                <span class="text-sm">Interlab</span>
+                            </label>
+                        </div>
+                        <div class="md:col-span-3">
+                            <button type="submit" class="w-full py-2 rounded-lg text-white font-bold bg-gradient-to-r from-blue-400 to-purple-500 hover:from-blue-500 hover:to-purple-600">
+                                เพิ่มผู้ใช้งาน
+                            </button>
+                        </div>
+                        <p id="user-status" class="text-center md:col-span-3 mt-2"></p>
+                    </form>
+                    <div class="overflow-x-auto">
+                        <table class="min-w-full divide-y divide-gray-200">
+                            <thead class="bg-gray-50">
+                                <tr>
+                                    <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">ชื่อผู้ใช้</th>
+                                    <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">บทบาท</th>
+                                    <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">สิทธิ์</th>
+                                    <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">จัดการ</th>
+                                </tr>
+                            </thead>
+                            <tbody class="bg-white divide-y divide-gray-200">
+                                ${tableRows || `<tr><td colspan="4" class="text-center text-gray-500 py-4">ยังไม่มีผู้ใช้งาน</td></tr>`}
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+            `;
+        };
+
+        const renderUsageHistory = () => {
+            const tableRows = appState.history.map(log => `
+                <tr>
+                    <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-900">${new Date(log.timestamp).toLocaleString('th-TH')}</td>
+                    <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-900">${log.username}</td>
+                    <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-900">${log.action}</td>
+                    <td class="px-6 py-4 whitespace-wrap text-sm text-gray-900">${log.details}</td>
+                </tr>
+            `).join('');
+
+            return `
+                <div class="bg-white p-6 rounded-lg shadow-md mb-6 overflow-x-auto">
+                    <h3 class="text-xl font-semibold text-gray-800 mb-4">ประวัติการใช้งาน</h3>
+                    <table class="min-w-full divide-y divide-gray-200">
+                        <thead class="bg-gray-50">
+                            <tr>
+                                <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">วัน-เวลา</th>
+                                <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">ผู้ใช้งาน</th>
+                                <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">การกระทำ</th>
+                                <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">รายละเอียด</th>
+                            </tr>
+                        </thead>
+                        <tbody class="bg-white divide-y divide-gray-200">
+                            ${tableRows || `<tr><td colspan="4" class="text-center text-gray-500 py-4">ยังไม่มีประวัติการใช้งาน</td></tr>`}
+                        </tbody>
+                    </table>
+                </div>
+            `;
+        };
+        
+        const renderDataClearer = () => {
+            return `
+                <div class="bg-white p-6 rounded-lg shadow-md mb-6">
+                    <h3 class="text-xl font-semibold text-gray-800 mb-4">ล้างข้อมูลตามช่วงเวลา</h3>
+                    <form id="clear-data-form">
+                        <div class="grid grid-cols-1 sm:grid-cols-2 gap-4 mb-4">
+                            <div>
+                                <label class="block text-gray-700 mb-1">เลือกชุดข้อมูล</label>
+                                <select id="collection-to-clear" class="w-full p-2 border rounded-lg">
+                                    <option value="eqas">EQA</option>
+                                    <option value="interlabs">Interlab Comparison</option>
+                                    <option value="history">ประวัติการใช้งาน</option>
+                                </select>
+                            </div>
+                            <div>
+                                <label class="block text-gray-700 mb-1">วันที่เริ่มต้น</label>
+                                <input type="date" id="start-date" class="w-full p-2 border rounded-lg" />
+                            </div>
+                            <div>
+                                <label class="block text-gray-700 mb-1">วันที่สิ้นสุด</label>
+                                <input type="date" id="end-date" class="w-full p-2 border rounded-lg" />
+                            </div>
+                        </div>
+                        <p id="clear-status" class="text-center text-gray-600 mb-4"></p>
+                        <button type="submit" class="w-full py-3 rounded-lg text-white font-bold transition duration-300 bg-gray-400 cursor-not-allowed">
+                            ลบข้อมูลทั้งหมดที่ตรงตามเงื่อนไข
+                        </button>
+                    </form>
+                </div>
+            `;
+        };
+
+        const renderAdminSettings = () => {
+            return `
+                <div class="bg-white p-6 rounded-lg shadow-md mb-6">
+                    <h3 class="text-xl font-semibold text-gray-800 mb-4">ตั้งค่าระบบ</h3>
+                    <form id="settings-form">
+                        <div class="mb-4">
+                            <label class="block text-gray-700 mb-1">ชื่อระบบ</label>
+                            <input type="text" name="systemName" value="${appState.appSettings.systemName}" class="w-full p-2 border rounded-lg" />
+                        </div>
+                        <div class="mb-4">
+                            <label class="block text-gray-700 mb-1">URL โลโก้</label>
+                            <input type="text" name="logoUrl" value="${appState.appSettings.logoUrl}" placeholder="เช่น https://example.com/logo.png" class="w-full p-2 border rounded-lg" />
+                        </div>
+                        <button type="submit" class="w-full py-3 rounded-lg text-white font-bold transition duration-300 bg-gradient-to-r from-blue-400 to-purple-500 hover:from-blue-500 hover:to-purple-600">
+                            บันทึกการตั้งค่า
+                        </button>
+                    </form>
+                </div>
+            `;
+        };
+
+        const renderContent = () => {
+            if (!appState.user) {
+                return renderLoginComponent();
+            }
+            
+            let mainContent = '';
+            switch (appState.activeTab) {
+                case 'eqa':
+                    if (!appState.user.permissions?.canAccessEQA) {
+                        mainContent = `<p class="text-center text-red-500">คุณไม่มีสิทธิ์เข้าถึงหน้านี้</p>`;
+                    } else {
+                        mainContent = renderDataEntryForm('eqas') + renderDataDisplay(appState.eqas, 'eqas');
+                    }
+                    break;
+                case 'interlab':
+                    if (!appState.user.permissions?.canAccessInterlab) {
+                        mainContent = `<p class="text-center text-red-500">คุณไม่มีสิทธิ์เข้าถึงหน้านี้</p>`;
+                    } else {
+                        mainContent = renderDataEntryForm('interlabs') + renderDataDisplay(appState.interlabs, 'interlabs');
+                    }
+                    break;
+                case 'summary':
+                    mainContent = renderAnnualSummary();
+                    break;
+                case 'admin':
+                    if (appState.user.role !== 'admin') {
+                        mainContent = `<p class="text-center text-red-500">คุณไม่มีสิทธิ์เข้าถึงหน้านี้</p>`;
+                    } else {
+                        mainContent = renderAdminDashboard();
+                    }
+                    break;
+            }
+
+            return `
+                <div class="bg-gray-100 p-4 sm:p-8 flex flex-col min-h-screen font-sans">
+                    ${renderHeader()}
+                    <main class="flex-1 w-full max-w-4xl mx-auto">
+                        ${mainContent}
+                    </main>
+                    ${renderModal()}
+                </div>
+            `;
+        };
+
+        const attachEventListeners = () => {
+            // Login Form
+            const loginForm = document.getElementById('login-form');
+            if (loginForm) {
+                loginForm.addEventListener('submit', (e) => {
+                    e.preventDefault();
+                    const username = document.getElementById('username').value;
+                    const password = document.getElementById('password').value;
+                    handleLogin(username, password);
+                });
+            }
+
+            // Logout Button
+            const logoutBtn = document.getElementById('logout-btn');
+            if (logoutBtn) {
+                logoutBtn.addEventListener('click', handleLogout);
+            }
+
+            // Tab Buttons
+            ['eqa', 'interlab', 'summary', 'admin'].forEach(tab => {
+                const tabBtn = document.getElementById(`tab-${tab}`);
+                if (tabBtn) {
+                    tabBtn.addEventListener('click', () => {
+                        appState.activeTab = tab;
+                        render();
+                    });
+                }
+            });
+
+            // Data Entry Forms
+            const eqaForm = document.getElementById('data-entry-form-eqas');
+            if (eqaForm) {
+                eqaForm.addEventListener('submit', async (e) => {
+                    e.preventDefault();
+                    const formData = Object.fromEntries(new FormData(e.target).entries());
+                    const statusEl = document.getElementById('status-eqas');
+                    statusEl.textContent = 'กำลังบันทึก...';
+                    const success = await handleSaveData('eqas', formData);
+                    statusEl.textContent = success ? 'บันทึกข้อมูลสำเร็จ!' : 'เกิดข้อผิดพลาดในการบันทึกข้อมูล';
+                    if (success) e.target.reset();
+                });
+            }
+            const interlabForm = document.getElementById('data-entry-form-interlabs');
+            if (interlabForm) {
+                interlabForm.addEventListener('submit', async (e) => {
+                    e.preventDefault();
+                    const formData = Object.fromEntries(new FormData(e.target).entries());
+                    const statusEl = document.getElementById('status-interlabs');
+                    statusEl.textContent = 'กำลังบันทึก...';
+                    const success = await handleSaveData('interlabs', formData);
+                    statusEl.textContent = success ? 'บันทึกข้อมูลสำเร็จ!' : 'เกิดข้อผิดพลาดในการบันทึกข้อมูล';
+                    if (success) e.target.reset();
+                });
+            }
+
+            // Edit and Delete Buttons
+            document.querySelectorAll('.edit-btn').forEach(btn => {
+                btn.addEventListener('click', (e) => {
+                    const id = e.target.closest('tr').dataset.id;
+                    const type = appState.activeTab === 'eqa' ? 'eqas' : 'interlabs';
+                    const data = type === 'eqas' ? appState.eqas : appState.interlabs;
+                    appState.editingItem = data.find(item => item.id === id);
+                    render();
+                });
+            });
+
+            document.querySelectorAll('.delete-btn').forEach(btn => {
+                btn.addEventListener('click', (e) => {
+                    const id = e.target.closest('tr').dataset.id;
+                    const type = appState.activeTab === 'eqa' ? 'eqas' : 'interlabs';
+                    handleDeleteData(type, id);
+                });
+            });
+            
+            const modalCancelBtn = document.getElementById('cancel-edit');
+            if (modalCancelBtn) {
+                modalCancelBtn.addEventListener('click', () => {
+                    appState.editingItem = null;
+                    render();
+                });
+            }
+            const editForm = document.getElementById('edit-form');
+            if (editForm) {
+                editForm.addEventListener('submit', async (e) => {
+                    e.preventDefault();
+                    const formData = Object.fromEntries(new FormData(e.target).entries());
+                    const id = e.target.dataset.id;
+                    const type = e.target.dataset.type;
+                    const success = await handleUpdateData(type, id, formData);
+                    if (success) {
+                        appState.editingItem = null;
+                        render();
+                    }
+                });
+            }
+
+            // Admin Sub-tabs
+            ['masterData', 'userManagement', 'history', 'clearData', 'settings'].forEach(subtab => {
+                const subtabBtn = document.getElementById(`sub-tab-${subtab}`);
+                if (subtabBtn) {
+                    subtabBtn.addEventListener('click', () => {
+                        appState.adminSubTab = subtab;
+                        render();
+                    });
+                }
+            });
+
+            // Master Data Forms
+            const addProjectForm = document.getElementById('add-project-form');
+            if (addProjectForm) {
+                addProjectForm.addEventListener('submit', (e) => {
+                    e.preventDefault();
+                    handleAddMasterData('projects', e.target.project.value);
+                    e.target.reset();
+                });
+            }
+            const addTestForm = document.getElementById('add-test-form');
+            if (addTestForm) {
+                addTestForm.addEventListener('submit', (e) => {
+                    e.preventDefault();
+                    handleAddMasterData('tests', e.target.test.value);
+                    e.target.reset();
+                });
+            }
+            const addOrgForm = document.getElementById('add-org-form');
+            if (addOrgForm) {
+                addOrgForm.addEventListener('submit', (e) => {
+                    e.preventDefault();
+                    handleAddMasterData('organizations', e.target.org.value);
+                    e.target.reset();
+                });
+            }
+            document.querySelectorAll('.delete-master-data-btn').forEach(btn => {
+                btn.addEventListener('click', (e) => {
+                    const type = e.target.dataset.type;
+                    const value = e.target.dataset.value;
+                    handleDeleteMasterData(type, value);
+                });
+            });
+
+            // User Management
+            const addUserForm = document.getElementById('add-user-form');
+            if (addUserForm) {
+                addUserForm.addEventListener('submit', async (e) => {
+                    e.preventDefault();
+                    const formData = Object.fromEntries(new FormData(e.target).entries());
+                    const statusEl = document.getElementById('user-status');
+                    statusEl.textContent = 'กำลังเพิ่มผู้ใช้...';
+                    await handleAddUser(formData);
+                    statusEl.textContent = 'เพิ่มผู้ใช้สำเร็จ!';
+                    e.target.reset();
+                });
+            }
+            document.querySelectorAll('.delete-user-btn').forEach(btn => {
+                btn.addEventListener('click', (e) => {
+                    const id = e.target.dataset.id;
+                    const username = e.target.dataset.username;
+                    handleDeleteUser(id, username);
+                });
+            });
+
+            // Data Clearer Form
+            const clearDataForm = document.getElementById('clear-data-form');
+            if (clearDataForm) {
+                clearDataForm.addEventListener('submit', (e) => {
+                    e.preventDefault();
+                    const collection = document.getElementById('collection-to-clear').value;
+                    const start = document.getElementById('start-date').value;
+                    const end = document.getElementById('end-date').value;
+                    handleClearData(collection, start, end);
+                });
+            }
+
+            // Admin Settings Form
+            const settingsForm = document.getElementById('settings-form');
+            if (settingsForm) {
+                settingsForm.addEventListener('submit', (e) => {
+                    e.preventDefault();
+                    const formData = Object.fromEntries(new FormData(e.target).entries());
+                    handleUpdateSettings(formData);
+                });
+            }
+        };
+
+        const render = () => {
+            root.innerHTML = renderContent();
+            attachEventListeners();
+        };
+
+        // Initial render on page load
+        window.onload = initializeSupabase;
+    </script>
+
+</body>
+</html>
